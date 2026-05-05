@@ -1,0 +1,68 @@
+[package]
+name = "discord-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local-first Rust port of jackwener/discord-cli — read-only Discord archival CLI"
+repository = "https://github.com/lengoclongk59/discord-cli-rs"
+authors = ["lengoclongk59"]
+
+[[bin]]
+name = "discord"
+path = "src/main.rs"
+
+[dependencies]
+discord-user-rs = { path = "../discord-user-rs", default-features = false }
+
+# Async / runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "signal"] }
+
+# HTTP (only for the sanctioned auth/windows.rs validate_token exception)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Config
+dotenvy = "0.15"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Output
+comfy-table = "7"
+colored = "2"
+indicatif = "0.17"
+
+# Misc
+rand = "0.9"
+base64 = "0.22"
+aes-gcm = "0.10"
+secrecy = "0.10"
+zeroize = "1"
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+walkdir = "2"

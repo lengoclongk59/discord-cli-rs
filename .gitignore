@@ -1,0 +1,10 @@
+/target
+.env
+discord.db
+*.db-journal
+*.db-shm
+*.db-wal
+.idea/
+.omc/
+.cargo/
+downloads/
