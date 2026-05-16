@@ -8,7 +8,7 @@ use crate::config;
 use crate::output;
 
 pub async fn run(ctx: &Ctx) -> Result<()> {
-    let token = match config::resolve_token(ctx.token_flag.clone()) {
+    let token = match config::resolve_token(ctx.token_flag.as_deref()) {
         Ok(t) => t,
         Err(e) => {
             if ctx.json {

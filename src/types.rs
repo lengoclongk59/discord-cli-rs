@@ -3,6 +3,7 @@
 //! Insulates the binary from upstream `discord_user::types` churn — we only
 //! deserialize the fields we actually use.
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -132,17 +133,22 @@ impl StoredMessage {
     /// Convert a raw API message into the SQLite row form used by `Db`.
     /// Falls back to `None` for guild/channel name; callers that have
     /// resolved the parent guild should pass a populated `ChannelContext`
-    /// via `from_raw_with_ctx`.
-    pub fn from_raw(raw: &MessageRaw, channel_id: &str) -> Self {
-        Self::from_raw_with_ctx(raw, channel_id, &ChannelContext::default())
+    /// via `try_from_raw_with_ctx`.
+    pub fn try_from_raw(raw: &MessageRaw, channel_id: &str) -> Result<Self> {
+        Self::try_from_raw_with_ctx(raw, channel_id, &ChannelContext::default())
     }
 
-    pub fn from_raw_with_ctx(
+    /// Validates the RFC3339 timestamp on the wire — a malformed timestamp
+    /// is a real corruption signal and surfaces as `Err` rather than
+    /// silently degrading to epoch (which would poison every chronological
+    /// query in the archive).
+    pub fn try_from_raw_with_ctx(
         raw: &MessageRaw,
         channel_id: &str,
         ctx: &ChannelContext,
-    ) -> Self {
-        let mut content_parts: Vec<String> = Vec::new();
+    ) -> Result<Self> {
+        let mut content_parts: Vec<String> =
+            Vec::with_capacity(1 + raw.attachments.len() + raw.embeds.len());
         if !raw.content.is_empty() {
             content_parts.push(raw.content.clone());
         }
@@ -155,13 +161,9 @@ impl StoredMessage {
             }
         }
         let content = content_parts.join("\n");
-        // RFC3339 parse is lossy on bad input; fall back to epoch so we
-        // don't mint a fake "now" that poisons every chronological query.
         let timestamp = DateTime::parse_from_rfc3339(&raw.timestamp)
             .map(|t| t.with_timezone(&Utc))
-            .unwrap_or_else(|_| {
-                DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
-            });
+            .with_context(|| format!("invalid timestamp on message {}: {:?}", raw.id, raw.timestamp))?;
 
         let sender_name = raw
             .author
@@ -185,7 +187,7 @@ impl StoredMessage {
             })
             .collect();
 
-        StoredMessage {
+        Ok(StoredMessage {
             msg_id: raw.id.clone(),
             channel_id: channel_id.to_string(),
             sender_id: Some(raw.author.id.clone()),
@@ -197,7 +199,7 @@ impl StoredMessage {
             channel_name: ctx.channel_name.clone(),
             edited_timestamp: raw.edited_timestamp.clone(),
             attachments,
-        }
+        })
     }
 }
 

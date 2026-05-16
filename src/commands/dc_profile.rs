@@ -8,7 +8,7 @@ use crate::config;
 use crate::output;
 
 pub async fn run(ctx: &Ctx, user_id: Option<&str>) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
 
     let uid = match user_id {

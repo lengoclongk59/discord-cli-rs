@@ -35,12 +35,14 @@
 
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use serde::Deserialize;
+use tracing::{debug, info};
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 use zeroize::Zeroizing;
@@ -52,6 +54,14 @@ const TOKEN_PREFIX: &[u8] = b"dQw4w9WgXcQ:";
 const BASE64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
 const DPAPI_PREFIX: &[u8] = b"DPAPI";
 const GCM_NONCE_LEN: usize = 12;
+const VALIDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Cap each candidate blob to a sane ceiling. Real Discord token blobs are
+/// well under 1KB.
+const MAX_BLOB_BYTES: usize = 4096;
+/// Cap DPAPI input size — Win32 takes a `u32` byte count and we want to
+/// fail loud rather than silently truncate.
+const MAX_DPAPI_INPUT: usize = u32::MAX as usize;
 
 #[derive(Debug, Deserialize)]
 struct MeMin {
@@ -76,78 +86,85 @@ pub async fn find_and_save_token() -> Result<DiscoveredToken> {
         ));
     }
 
-    // Step 1: recover the AES-256 master key from Local State.
-    let master_key = recover_master_key(&local_state).with_context(|| {
-        format!(
-            "failed to recover master key from {}",
-            local_state.display()
-        )
-    })?;
+    // Step 1 & 2 (CPU + sync I/O): recover master key, scan LevelDB,
+    // AES-GCM decrypt candidate blobs. Done on a blocking thread so we
+    // don't stall the tokio worker driving validation HTTP.
+    let local_state_for_blocking = local_state.clone();
+    let leveldb_dir_for_blocking = leveldb_dir.clone();
+    let candidates = tokio::task::spawn_blocking(move || -> Result<Vec<Zeroizing<String>>> {
+        let master_key = recover_master_key(&local_state_for_blocking).with_context(|| {
+            format!(
+                "failed to recover master key from {}",
+                local_state_for_blocking.display()
+            )
+        })?;
+        let blobs = scan_for_token_blobs(&leveldb_dir_for_blocking).with_context(|| {
+            format!(
+                "failed to read {} (close Discord and retry — LevelDB may be locked)",
+                leveldb_dir_for_blocking.display()
+            )
+        })?;
+        if blobs.is_empty() {
+            return Ok(Vec::new());
+        }
+        info!(blob_count = blobs.len(), "decrypting candidate blobs via AES-GCM");
 
-    // Step 2: scan LevelDB for candidate ciphertexts.
-    let blobs = scan_for_token_blobs(&leveldb_dir).with_context(|| {
-        format!(
-            "failed to read {} (close Discord and retry — LevelDB may be locked)",
-            leveldb_dir.display()
-        )
-    })?;
-    if blobs.is_empty() {
+        let master_key = Zeroizing::new(master_key);
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&master_key));
+        let mut out: Vec<Zeroizing<String>> = Vec::new();
+        for blob in blobs {
+            if blob.len() > MAX_BLOB_BYTES {
+                continue;
+            }
+            match aes_gcm_decrypt(&cipher, &blob) {
+                Ok(plain) => {
+                    let plain = Zeroizing::new(plain);
+                    let candidate = match std::str::from_utf8(&plain) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if candidate.is_empty() || !looks_like_discord_token(candidate) {
+                        continue;
+                    }
+                    out.push(Zeroizing::new(candidate.to_string()));
+                }
+                Err(e) => {
+                    debug!(error = %e, "AES-GCM decrypt failed");
+                }
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .context("spawn_blocking for token scan panicked")??;
+
+    if candidates.is_empty() {
         return Err(anyhow!(
-            "No encrypted token blobs found in {}. Make sure you're logged into the Discord desktop app.",
+            "No encrypted token blobs decrypted to a plausible Discord token in {}.\n\
+             Make sure you're logged into the Discord desktop app.",
             leveldb_dir.display()
         ));
     }
 
-    eprintln!(
-        "Found {} candidate blob(s); decrypting via AES-GCM and validating...",
-        blobs.len()
-    );
-
-    // Wrap the master key so it's zeroed on drop instead of lingering in
-    // memory after we hand it to AES-GCM.
-    let master_key = Zeroizing::new(master_key);
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&master_key));
+    // Step 3 (async network I/O): validate each candidate against
+    // `GET /users/@me`. First success wins.
     let mut last_err: Option<String> = None;
-    for blob in blobs {
-        // Defense in depth: cap input size to a sane ceiling.
-        if blob.len() > 4096 {
-            continue;
-        }
-        match aes_gcm_decrypt(&cipher, &blob) {
-            Ok(plain) => {
-                // `plain` is wiped on drop. We MUST validate via &str
-                // borrow rather than cloning into a plain String.
-                let plain = Zeroizing::new(plain);
-                let candidate = match std::str::from_utf8(&plain) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if candidate.is_empty() {
-                    continue;
-                }
-                if !looks_like_discord_token(candidate) {
-                    continue;
-                }
-                match validate_token(candidate).await {
-                    Ok(me) => {
-                        return Ok(DiscoveredToken {
-                            token: candidate.to_string(),
-                            source: format!("{}", leveldb_dir.display()),
-                            username: me.global_name.unwrap_or(me.username),
-                        });
-                    }
-                    Err(e) => {
-                        last_err = Some(format!("validate: {}", e));
-                    }
-                }
+    for candidate in &candidates {
+        match validate_token(candidate).await {
+            Ok(me) => {
+                return Ok(DiscoveredToken {
+                    token: candidate.to_string(),
+                    source: format!("{}", leveldb_dir.display()),
+                    username: me.global_name.unwrap_or(me.username),
+                });
             }
             Err(e) => {
-                last_err = Some(format!("AES-GCM: {}", e));
+                last_err = Some(format!("validate: {}", e));
             }
         }
     }
     Err(anyhow!(
-        "All candidate tokens failed to decrypt or validate. Last error: {}",
+        "All candidate tokens failed to validate. Last error: {}",
         last_err.unwrap_or_else(|| "(unknown)".to_string())
     ))
 }
@@ -233,7 +250,10 @@ fn scan_for_token_blobs(dir: &Path) -> Result<Vec<Vec<u8>>> {
         }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
-            Err(_) => continue, // skip files we can't read (locked, etc.)
+            Err(e) => {
+                debug!(path = %path.display(), error = %e, "skip unreadable leveldb file");
+                continue;
+            }
         };
         for hit in scan_bytes_for_prefix(&bytes, TOKEN_PREFIX) {
             if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&hit) {
@@ -279,8 +299,15 @@ fn scan_bytes_for_prefix<'a>(haystack: &'a [u8], prefix: &'a [u8]) -> Vec<Vec<u8
 
 /// Call Win32 `CryptUnprotectData` on a single blob.
 fn dpapi_decrypt(input: &[u8]) -> Result<Vec<u8>> {
+    if input.len() > MAX_DPAPI_INPUT {
+        return Err(anyhow!(
+            "DPAPI input is {} bytes; refusing to truncate to u32",
+            input.len()
+        ));
+    }
+    let cb_data = u32::try_from(input.len()).expect("bounded by MAX_DPAPI_INPUT above");
     let data_in = CRYPT_INTEGER_BLOB {
-        cbData: input.len() as u32,
+        cbData: cb_data,
         pbData: input.as_ptr() as *mut u8,
     };
     let mut data_out = CRYPT_INTEGER_BLOB::default();
@@ -300,7 +327,8 @@ fn dpapi_decrypt(input: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| anyhow!("CryptUnprotectData failed: {:?}", e))?;
     }
 
-    let len = data_out.cbData as usize;
+    let len = usize::try_from(data_out.cbData)
+        .context("DPAPI output length overflows usize")?;
     let mut buf: Vec<u8> = Vec::with_capacity(len);
     if !data_out.pbData.is_null() {
         if len > 0 {
@@ -311,7 +339,9 @@ fn dpapi_decrypt(input: &[u8]) -> Result<Vec<u8>> {
             }
         }
         // SAFETY: Always free the OS allocation, even on degenerate len=0
-        // success paths, to avoid leaks.
+        // success paths, to avoid leaks. `LocalFree` returns the unfreed
+        // handle (NULL on success); we have no use for it and ignoring is
+        // standard for this Win32 API.
         unsafe {
             let _ = LocalFree(HLOCAL(data_out.pbData as _));
         }
@@ -324,7 +354,8 @@ fn dpapi_decrypt(input: &[u8]) -> Result<Vec<u8>> {
 async fn validate_token(token: &str) -> Result<MeMin> {
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(VALIDATE_CONNECT_TIMEOUT)
+        .timeout(VALIDATE_TIMEOUT)
         .build()?;
     let resp = client
         .get("https://discord.com/api/v10/users/@me")

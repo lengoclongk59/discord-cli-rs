@@ -2,11 +2,18 @@
 
 use std::path::Path;
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Local, NaiveTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::types::StoredMessage;
+
+/// One row of `attachments_for_channel`: `(msg_id, attach_id, filename,
+/// url, content_type, size)`. The `dc download` callsite tags this shape
+/// once at the boundary instead of leaving a 6-tuple in the signature.
+pub type AttachmentRow = (String, String, String, String, Option<String>, i64);
 
 pub struct Db {
     conn: Connection,
@@ -119,18 +126,19 @@ impl Db {
     }
 
     /// True iff the FTS5 virtual table exists. Cached per call site —
-    /// SQLite catalog lookups are cheap.
-    fn has_fts(&self) -> bool {
-        self.conn
+    /// SQLite catalog lookups are cheap. A genuine I/O error here would
+    /// also bubble out of every subsequent `query_map` call, so we surface
+    /// it via `Result` instead of folding it into a `false`.
+    fn has_fts(&self) -> Result<bool> {
+        let row: Option<i64> = self
+            .conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'",
                 [],
                 |r| r.get::<_, i64>(0),
             )
-            .optional()
-            .ok()
-            .flatten()
-            .is_some()
+            .optional()?;
+        Ok(row.is_some())
     }
 
     /// Returns the maximum (newest) `msg_id` stored for the channel, or `None`
@@ -145,6 +153,52 @@ impl Db {
             .query_row(params![channel_id], |r| r.get(0))
             .optional()?;
         Ok(row)
+    }
+
+    /// Batched `last_msg_id` for a set of channels. Returns a map from
+    /// channel_id → latest stored msg_id (entries absent for channels with
+    /// no rows). Replaces a per-channel `last_msg_id` loop in `dc sync-all`
+    /// — one round-trip instead of N.
+    ///
+    /// Semantically identical to calling `last_msg_id` per channel: returns
+    /// the **raw TEXT** of the winning row, not a re-stringified i64. This
+    /// matters because `MAX(CAST(... AS INTEGER))` would canonicalize the
+    /// value (strip leading zeros, collapse non-numeric chars). We use a
+    /// correlated subquery so the outer SELECT returns the original
+    /// `msg_id` column verbatim.
+    pub fn last_msg_ids(&self, channel_ids: &[&str]) -> Result<HashMap<String, String>> {
+        if channel_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut placeholders = String::with_capacity(channel_ids.len() * 2);
+        for i in 0..channel_ids.len() {
+            if i > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push('?');
+        }
+        let sql = format!(
+            "SELECT m.channel_id, m.msg_id
+             FROM messages m
+             WHERE m.channel_id IN ({ph})
+               AND CAST(m.msg_id AS INTEGER) = (
+                   SELECT MAX(CAST(msg_id AS INTEGER))
+                   FROM messages
+                   WHERE channel_id = m.channel_id
+               )",
+            ph = placeholders
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mapped = stmt.query_map(
+            params_from_iter(channel_ids.iter().copied()),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let mut out = HashMap::with_capacity(channel_ids.len());
+        for row in mapped {
+            let (cid, msg_id) = row?;
+            out.insert(cid, msg_id);
+        }
+        Ok(out)
     }
 
     /// Insert a batch in a transaction. New rows are inserted; existing rows
@@ -195,13 +249,15 @@ impl Db {
                     m.edited_timestamp,
                 ])?;
                 for a in &m.attachments {
+                    let size_i64 = i64::try_from(a.size)
+                        .with_context(|| format!("attachment size {} overflows i64", a.size))?;
                     att_stmt.execute(params![
                         m.msg_id,
                         a.attach_id,
                         a.filename,
                         a.url,
                         a.content_type,
-                        a.size as i64,
+                        size_i64,
                     ])?;
                 }
             }
@@ -210,7 +266,8 @@ impl Db {
         let post_total: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
-        Ok((post_total - pre_total).max(0) as usize)
+        let delta = (post_total - pre_total).max(0);
+        Ok(usize::try_from(delta).unwrap_or(usize::MAX))
     }
 
     /// Apply a `MESSAGE_UPDATE` from the gateway to the local archive.
@@ -256,7 +313,7 @@ impl Db {
     ) -> Result<Vec<StoredMessage>> {
         // Prefer FTS5 when available; fall back to LIKE for legacy DBs or
         // SQLite builds compiled without FTS5.
-        let rows: Vec<StoredMessage> = if self.has_fts() {
+        let rows: Vec<StoredMessage> = if self.has_fts()? {
             let mut sql = String::from(
                 "SELECT m.msg_id, m.channel_id, m.sender_id, m.sender_name, m.content, m.timestamp,
                         m.guild_id, m.guild_name, m.channel_name, m.edited_timestamp
@@ -276,12 +333,10 @@ impl Db {
             let mut stmt = self.conn.prepare(&sql)?;
             if let Some(cid) = channel_id {
                 stmt.query_map(params![phrase, cid, limit], row_to_msg)?
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 stmt.query_map(params![phrase, limit], row_to_msg)?
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             }
         } else {
             let pattern = format!("%{}%", keyword.to_lowercase());
@@ -300,12 +355,10 @@ impl Db {
             let mut stmt = self.conn.prepare(&sql)?;
             if let Some(cid) = channel_id {
                 stmt.query_map(params![pattern, cid, limit], row_to_msg)?
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             } else {
                 stmt.query_map(params![pattern, limit], row_to_msg)?
-                    .filter_map(|r| r.ok())
-                    .collect()
+                    .collect::<rusqlite::Result<Vec<_>>>()?
             }
         };
         let mut out = rows;
@@ -321,7 +374,7 @@ impl Db {
         &self,
         channel_id: &str,
         hours: Option<i64>,
-    ) -> Result<Vec<(String, String, String, String, Option<String>, i64)>> {
+    ) -> Result<Vec<AttachmentRow>> {
         let cutoff =
             hours.map(|h| (Utc::now() - chrono::Duration::hours(h)).to_rfc3339());
         let mut sql = String::from(
@@ -336,25 +389,16 @@ impl Db {
         }
         sql.push_str(" ORDER BY m.timestamp ASC");
         let mut stmt = self.conn.prepare(&sql)?;
-        let mapper = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            i64,
-        )> {
+        let mapper = |r: &rusqlite::Row<'_>| -> rusqlite::Result<AttachmentRow> {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         };
         let rows: Vec<_> = match cutoff {
             Some(c) => stmt
                 .query_map(params![channel_id, c], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
+                .collect::<rusqlite::Result<Vec<_>>>()?,
             None => stmt
                 .query_map(params![channel_id], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
+                .collect::<rusqlite::Result<Vec<_>>>()?,
         };
         Ok(rows)
     }
@@ -371,16 +415,12 @@ impl Db {
              FROM messages WHERE 1=1",
         );
         let mut bind_idx = 1usize;
-        let mut cid_pos: Option<usize> = None;
-        let mut hours_pos: Option<usize> = None;
         if channel_id.is_some() {
             sql.push_str(&format!(" AND channel_id = ?{}", bind_idx));
-            cid_pos = Some(bind_idx);
             bind_idx += 1;
         }
         if hours.is_some() {
             sql.push_str(&format!(" AND timestamp >= ?{}", bind_idx));
-            hours_pos = Some(bind_idx);
             bind_idx += 1;
         }
         sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ?{}", bind_idx));
@@ -388,26 +428,19 @@ impl Db {
         let cutoff = hours.map(|h| (Utc::now() - chrono::Duration::hours(h)).to_rfc3339());
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows: Vec<StoredMessage> = match (cid_pos, hours_pos) {
-            (Some(_), Some(_)) => stmt
-                .query_map(
-                    params![channel_id.unwrap(), cutoff.unwrap(), limit],
-                    row_to_msg,
-                )?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (Some(_), None) => stmt
-                .query_map(params![channel_id.unwrap(), limit], row_to_msg)?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (None, Some(_)) => stmt
-                .query_map(params![cutoff.unwrap(), limit], row_to_msg)?
-                .filter_map(|r| r.ok())
-                .collect(),
+        let rows: Vec<StoredMessage> = match (channel_id, cutoff.as_deref()) {
+            (Some(cid), Some(c)) => stmt
+                .query_map(params![cid, c, limit], row_to_msg)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (Some(cid), None) => stmt
+                .query_map(params![cid, limit], row_to_msg)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (None, Some(c)) => stmt
+                .query_map(params![c, limit], row_to_msg)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
             (None, None) => stmt
                 .query_map(params![limit], row_to_msg)?
-                .filter_map(|r| r.ok())
-                .collect(),
+                .collect::<rusqlite::Result<Vec<_>>>()?,
         };
         let mut out = rows;
         out.reverse();
@@ -429,8 +462,7 @@ impl Db {
                     r.get::<_, i64>(2)?,
                 ))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -442,10 +474,9 @@ impl Db {
         )?;
         let ids: Vec<String> = stmt
             .query_map(params![name], |r| r.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        match ids.len() {
-            0 => {
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        match ids.as_slice() {
+            [] => {
                 // Check whether the local DB has any rows at all to give a better hint.
                 let total: i64 = self
                     .conn
@@ -462,10 +493,10 @@ impl Db {
                     ))
                 }
             }
-            1 => Ok(ids.into_iter().next().unwrap()),
-            n => Err(anyhow!(
+            [only] => Ok(only.clone()),
+            many => Err(anyhow!(
                 "{} channels match '{}'. Use a channel ID instead.",
-                n,
+                many.len(),
                 name
             )),
         }
@@ -494,12 +525,10 @@ impl Db {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<StoredMessage> = if let Some(cid) = channel_id {
             stmt.query_map(params![midnight, cid], row_to_msg)?
-                .filter_map(|r| r.ok())
-                .collect()
+                .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
             stmt.query_map(params![midnight], row_to_msg)?
-                .filter_map(|r| r.ok())
-                .collect()
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         Ok(rows)
     }
@@ -518,17 +547,12 @@ impl Db {
              FROM messages WHERE 1=1",
         );
         let mut bind_idx = 1usize;
-        let mut cid_pos: Option<usize> = None;
-        let mut hours_pos: Option<usize> = None;
-
         if channel_id.is_some() {
             sql.push_str(&format!(" AND channel_id = ?{}", bind_idx));
-            cid_pos = Some(bind_idx);
             bind_idx += 1;
         }
         if hours.is_some() {
             sql.push_str(&format!(" AND timestamp >= ?{}", bind_idx));
-            hours_pos = Some(bind_idx);
             bind_idx += 1;
         }
         sql.push_str(" GROUP BY COALESCE(sender_id, sender_name)");
@@ -541,23 +565,19 @@ impl Db {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         };
 
-        let rows: Vec<(String, i64, String, String)> = match (cid_pos, hours_pos) {
-            (Some(_), Some(_)) => stmt
-                .query_map(params![channel_id.unwrap(), cutoff.unwrap(), limit], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (Some(_), None) => stmt
-                .query_map(params![channel_id.unwrap(), limit], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (None, Some(_)) => stmt
-                .query_map(params![cutoff.unwrap(), limit], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
+        let rows: Vec<(String, i64, String, String)> = match (channel_id, cutoff.as_deref()) {
+            (Some(cid), Some(c)) => stmt
+                .query_map(params![cid, c, limit], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (Some(cid), None) => stmt
+                .query_map(params![cid, limit], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (None, Some(c)) => stmt
+                .query_map(params![c, limit], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
             (None, None) => stmt
                 .query_map(params![limit], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
+                .collect::<rusqlite::Result<Vec<_>>>()?,
         };
         Ok(rows)
     }
@@ -579,17 +599,12 @@ impl Db {
             bucket_expr
         );
         let mut bind_idx = 1usize;
-        let mut cid_pos: Option<usize> = None;
-        let mut hours_pos: Option<usize> = None;
-
         if channel_id.is_some() {
             sql.push_str(&format!(" AND channel_id = ?{}", bind_idx));
-            cid_pos = Some(bind_idx);
             bind_idx += 1;
         }
         if hours.is_some() {
             sql.push_str(&format!(" AND timestamp >= ?{}", bind_idx));
-            hours_pos = Some(bind_idx);
         }
         sql.push_str(" GROUP BY 1 ORDER BY 1");
 
@@ -600,20 +615,19 @@ impl Db {
             Ok((r.get(0)?, r.get(1)?))
         };
 
-        let rows: Vec<(String, i64)> = match (cid_pos, hours_pos) {
-            (Some(_), Some(_)) => stmt
-                .query_map(params![channel_id.unwrap(), cutoff.unwrap()], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (Some(_), None) => stmt
-                .query_map(params![channel_id.unwrap()], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (None, Some(_)) => stmt
-                .query_map(params![cutoff.unwrap()], mapper)?
-                .filter_map(|r| r.ok())
-                .collect(),
-            (None, None) => stmt.query_map([], mapper)?.filter_map(|r| r.ok()).collect(),
+        let rows: Vec<(String, i64)> = match (channel_id, cutoff.as_deref()) {
+            (Some(cid), Some(c)) => stmt
+                .query_map(params![cid, c], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (Some(cid), None) => stmt
+                .query_map(params![cid], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (None, Some(c)) => stmt
+                .query_map(params![c], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            (None, None) => stmt
+                .query_map([], mapper)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
         };
         Ok(rows)
     }
@@ -684,7 +698,7 @@ fn row_to_msg(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMessage> {
         guild_id: r.get(6)?,
         guild_name: r.get(7)?,
         channel_name: r.get(8)?,
-        edited_timestamp: r.get(9).ok(),
+        edited_timestamp: r.get::<_, Option<String>>(9)?,
         attachments: Vec::new(),
     })
 }
@@ -758,6 +772,51 @@ mod tests {
         assert_eq!(db.last_msg_id("c1").unwrap(), Some("101".to_string()));
         assert_eq!(db.last_msg_id("c2").unwrap(), Some("200".to_string()));
         assert_eq!(db.last_msg_id("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn last_msg_ids_matches_per_channel() {
+        // Realistic 19-digit snowflakes near u64 range — exercises the
+        // batched-vs-single semantic equivalence the reviewer flagged.
+        let mut db = Db::open_in_memory().unwrap();
+        let msgs = vec![
+            make_msg(
+                "1234567890123456789",
+                "c1",
+                "u1",
+                "alice",
+                "a",
+                "general",
+            ),
+            make_msg(
+                "1234567890123456790",
+                "c1",
+                "u1",
+                "alice",
+                "b",
+                "general",
+            ),
+            make_msg(
+                "9000000000000000001",
+                "c2",
+                "u2",
+                "bob",
+                "c",
+                "random",
+            ),
+        ];
+        db.insert_batch(&msgs).unwrap();
+
+        let single_c1 = db.last_msg_id("c1").unwrap();
+        let single_c2 = db.last_msg_id("c2").unwrap();
+        let single_nope = db.last_msg_id("nope").unwrap();
+
+        let batched = db.last_msg_ids(&["c1", "c2", "nope"]).unwrap();
+
+        assert_eq!(batched.get("c1").cloned(), single_c1);
+        assert_eq!(batched.get("c2").cloned(), single_c2);
+        assert!(!batched.contains_key("nope"));
+        assert!(single_nope.is_none());
     }
 
     #[test]

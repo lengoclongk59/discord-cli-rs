@@ -6,9 +6,10 @@ use crate::api::Api;
 use crate::commands::Ctx;
 use crate::config;
 use crate::output;
+use crate::wire_enums::PremiumType;
 
 pub async fn run(ctx: &Ctx) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
     let me = match api.get_me().await {
         Ok(m) => m,
@@ -25,13 +26,7 @@ pub async fn run(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
 
-    let premium = match me.premium_type {
-        0 => "None",
-        1 => "Nitro Classic",
-        2 => "Nitro",
-        3 => "Nitro Basic",
-        _ => "?",
-    };
+    let premium = PremiumType::from(me.premium_type).to_string();
     let rows = vec![
         vec!["id".into(), me.id.clone()],
         vec!["username".into(), format!("@{}", me.username)],
@@ -45,7 +40,7 @@ pub async fn run(ctx: &Ctx) -> Result<()> {
             "mfa".into(),
             if me.mfa_enabled { "✓" } else { "✗" }.to_string(),
         ],
-        vec!["nitro".into(), premium.to_string()],
+        vec!["nitro".into(), premium],
     ];
     output::print_table(&["field", "value"], &rows);
     Ok(())

@@ -9,7 +9,7 @@ use crate::output;
 use crate::types::{ChannelContext, StoredMessage};
 
 pub async fn run(ctx: &Ctx, channel: &str) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
 
     // Resolve metadata so the rendered output includes guild/channel name.
@@ -31,8 +31,8 @@ pub async fn run(ctx: &Ctx, channel: &str) -> Result<()> {
 
     let messages: Vec<StoredMessage> = pins
         .iter()
-        .map(|r| StoredMessage::from_raw_with_ctx(r, channel, &meta))
-        .collect();
+        .map(|r| StoredMessage::try_from_raw_with_ctx(r, channel, &meta))
+        .collect::<Result<Vec<_>>>()?;
 
     if ctx.json {
         output::print_json(&messages);

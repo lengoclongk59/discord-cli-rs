@@ -5,10 +5,11 @@
 //! channels that were synced before the v2 schema migration.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use tokio::fs;
 
 use crate::commands::resolve;
 use crate::commands::Ctx;
@@ -16,6 +17,10 @@ use crate::db::Db;
 use crate::output;
 
 const MAX_FILENAME_LEN: usize = 200;
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Windows reserved device names — cannot be used as filenames even with
 /// extensions. Matched case-insensitively against the file *stem*.
 const WIN_RESERVED: &[&str] = &[
@@ -27,17 +32,18 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
     let db = Db::open(&ctx.db_path)?;
     let channel_id = resolve::resolve_channel_required(&db, channel)?;
 
-    fs::create_dir_all(output_dir)?;
+    fs::create_dir_all(output_dir).await?;
     // Canonicalize once so the per-file containment check is meaningful
     // even when output_dir contains `..` segments.
     let output_dir_canonical = fs::canonicalize(output_dir)
+        .await
         .map_err(|e| anyhow!("output dir {}: {}", output_dir.display(), e))?;
 
     // Primary source: persisted attachment metadata.
-    let mut entries: Vec<(String, String, String)> = db
+    let mut entries: Vec<(String, String)> = db
         .attachments_for_channel(&channel_id, hours)?
         .into_iter()
-        .map(|(_msg, _attach, filename, url, _ct, _size)| (url, filename, String::new()))
+        .map(|(_msg, _attach, filename, url, _ct, _size)| (url, filename))
         .collect();
 
     // Legacy fallback: scan stored content for embedded URLs (covers
@@ -51,7 +57,7 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
                 {
                     let clean = word.split('?').next().unwrap_or(word).to_string();
                     let raw = clean.rsplit('/').next().unwrap_or("file").to_string();
-                    entries.push((clean, raw, String::new()));
+                    entries.push((clean, raw));
                 }
             }
         }
@@ -63,13 +69,15 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
     }
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("building HTTP client for attachment downloads")?;
     let mut downloaded = 0usize;
     let mut errors = 0usize;
-    let mut name_counter: HashMap<String, usize> = HashMap::new();
+    let mut name_counter: HashMap<String, usize> = HashMap::with_capacity(entries.len());
 
-    for (url, raw_name, _) in &entries {
+    for (url, raw_name) in &entries {
         let base = match safe_filename(raw_name) {
             Some(s) => s,
             None => {
@@ -79,8 +87,9 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
             }
         };
 
-        let count = name_counter.entry(base.clone()).or_insert(0);
-        let filename = if *count == 0 {
+        let count_entry = name_counter.entry(base.clone()).or_insert(0);
+        let n = *count_entry;
+        let filename = if n == 0 {
             base.clone()
         } else {
             let stem = Path::new(&base)
@@ -92,17 +101,14 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
                 .and_then(|e| e.to_str())
                 .unwrap_or("");
             if ext.is_empty() {
-                format!("{}_{}", stem, count)
+                format!("{}_{}", stem, n)
             } else {
-                format!("{}_{}.{}", stem, count, ext)
+                format!("{}_{}.{}", stem, n, ext)
             }
         };
-        *count += 1;
+        *count_entry += 1;
 
         let dest = output_dir_canonical.join(&filename);
-        // Enforce containment after canonicalization. The result is the
-        // dest with `.exists()`-relevant semantics but rejecting absolute
-        // or `..` components defensively.
         if Path::new(&filename)
             .components()
             .any(|c| !matches!(c, Component::Normal(_)))
@@ -118,7 +124,7 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Some(len) = resp.content_length() {
-                    if len > 100 * 1024 * 1024 {
+                    if len > MAX_FILE_BYTES {
                         output::err(&format!(
                             "Skipping {} ({}MB, too large)",
                             filename,
@@ -130,7 +136,7 @@ pub async fn run(ctx: &Ctx, channel: &str, output_dir: &Path, hours: Option<i64>
                 }
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        if let Err(e) = fs::write(&dest, &bytes) {
+                        if let Err(e) = fs::write(&dest, &bytes).await {
                             output::err(&format!("Write failed {}: {}", filename, e));
                             errors += 1;
                         } else {
@@ -210,10 +216,7 @@ fn safe_filename(input: &str) -> Option<String> {
         .file_stem()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    if WIN_RESERVED
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(stem))
-    {
+    if WIN_RESERVED.iter().any(|r| r.eq_ignore_ascii_case(stem)) {
         // Prefix to disambiguate. "nul.png" → "_nul.png".
         return Some(format!("_{}", s));
     }

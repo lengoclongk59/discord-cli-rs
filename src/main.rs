@@ -6,8 +6,10 @@ mod cli;
 mod commands;
 mod config;
 mod db;
+mod ids;
 mod output;
 mod types;
+mod wire_enums;
 
 use clap::Parser;
 use cli::Cli;

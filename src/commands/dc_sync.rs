@@ -14,7 +14,7 @@ use crate::output;
 use crate::types::ChannelContext;
 
 pub async fn run(ctx: &Ctx, channel: &str, limit: u32) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
     let mut db = Db::open(&ctx.db_path)?;
 

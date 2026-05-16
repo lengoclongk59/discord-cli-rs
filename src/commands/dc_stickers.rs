@@ -6,9 +6,10 @@ use crate::api::Api;
 use crate::commands::Ctx;
 use crate::config;
 use crate::output;
+use crate::wire_enums::StickerFormat;
 
 pub async fn run(ctx: &Ctx, guild: &str) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
 
     let guild_id = api.resolve_guild_id(guild).await?;
@@ -22,13 +23,6 @@ pub async fn run(ctx: &Ctx, guild: &str) -> Result<()> {
     if ctx.json {
         output::print_json(&stickers);
     } else {
-        let fmt_type = |t: u32| match t {
-            1 => "PNG",
-            2 => "APNG",
-            3 => "Lottie",
-            4 => "GIF",
-            _ => "?",
-        };
         let rows: Vec<Vec<String>> = stickers
             .iter()
             .map(|s| {
@@ -36,7 +30,7 @@ pub async fn run(ctx: &Ctx, guild: &str) -> Result<()> {
                     s.id.clone(),
                     s.name.clone(),
                     s.description.clone().unwrap_or_default(),
-                    fmt_type(s.format_type).to_string(),
+                    StickerFormat::from(s.format_type).to_string(),
                 ]
             })
             .collect();

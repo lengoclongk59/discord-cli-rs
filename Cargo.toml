@@ -1,18 +1,23 @@
 [package]
-name = "discord-cli"
+name = "discord-cli-rs"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Local-first Rust port of jackwener/discord-cli — read-only Discord archival CLI"
+description = "Local-first read-only Discord archival CLI — search, sync, tail, and download via a user token"
 repository = "https://github.com/lengoclongk59/discord-cli-rs"
-authors = ["lengoclongk59"]
+homepage = "https://github.com/lengoclongk59/discord-cli-rs"
+documentation = "https://docs.rs/discord-cli-rs"
+authors = ["lengoclongk59 <lengoclongk59@gmail.com>"]
+readme = "README.md"
+keywords = ["discord", "cli", "archive", "self-bot", "sqlite"]
+categories = ["command-line-utilities", "database"]
 
 [[bin]]
 name = "discord"
 path = "src/main.rs"
 
 [dependencies]
-discord-user-rs = { path = "../discord-user-rs", default-features = false }
+discord-user-rs = { version = "0.2.1", default-features = false }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time", "signal"] }
@@ -64,5 +69,5 @@ windows = { version = "0.58", features = [
 ] }
 
 [dev-dependencies]
-tempfile = "3"
+# tempfile is already a runtime dep (config::write_token_to_env); inheriting it.
 walkdir = "2"

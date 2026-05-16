@@ -8,7 +8,7 @@ use crate::config;
 use crate::output;
 
 pub async fn run(ctx: &Ctx) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
     let guilds = api.list_guilds().await?;
     if ctx.json {

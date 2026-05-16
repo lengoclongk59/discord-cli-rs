@@ -14,7 +14,7 @@ use crate::output;
 use crate::types::ChannelContext;
 
 pub async fn run(ctx: &Ctx, channel: &str, limit: u32) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
     let mut db = Db::open(&ctx.db_path)?;
 
@@ -50,7 +50,8 @@ pub async fn run(ctx: &Ctx, channel: &str, limit: u32) -> Result<()> {
     let total = page.messages.len();
     let inserted = db.insert_batch(&page.messages)?;
 
-    if let Some(oldest) = page.oldest_msg_id.as_deref() {
+    let oldest_str = page.oldest_msg_id.as_ref().map(|m| m.to_string());
+    if let Some(oldest) = &oldest_str {
         db.set_history_cursor(channel, oldest)?;
     }
 
@@ -60,7 +61,7 @@ pub async fn run(ctx: &Ctx, channel: &str, limit: u32) -> Result<()> {
             "stored": inserted,
             "channel_id": channel,
             "hit_limit": page.hit_limit,
-            "oldest_msg_id": page.oldest_msg_id,
+            "oldest_msg_id": oldest_str,
         }));
     } else {
         output::success(&format!("Fetched {}, stored {} new", total, inserted));

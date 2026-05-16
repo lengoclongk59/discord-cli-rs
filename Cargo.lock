@@ -452,7 +452,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "discord-cli"
+name = "discord-cli-rs"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -485,6 +485,8 @@ dependencies = [
 [[package]]
 name = "discord-user-rs"
 version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d2b9c474eb6348a02d623a67d4a29d8ff296294d48c93690ab2ab8f95285766"
 dependencies = [
  "base64",
  "bitflags",

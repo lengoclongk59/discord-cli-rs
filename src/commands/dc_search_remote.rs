@@ -14,7 +14,7 @@ pub async fn run(
     channel: Option<&str>,
     limit: u32,
 ) -> Result<()> {
-    let token = config::resolve_token(ctx.token_flag.clone())?;
+    let token = config::resolve_token(ctx.token_flag.as_deref())?;
     let api = Api::new(&token);
 
     let guild_id = api.resolve_guild_id(guild).await?;

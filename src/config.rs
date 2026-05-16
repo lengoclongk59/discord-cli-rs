@@ -14,9 +14,9 @@ use zeroize::Zeroize;
 /// 1. `cli_flag` (e.g. `--token <T>`)
 /// 2. `DISCORD_TOKEN` env var
 /// 3. `./.env` -> `DISCORD_TOKEN=...`
-pub fn resolve_token(cli_flag: Option<String>) -> Result<String> {
+pub fn resolve_token(cli_flag: Option<&str>) -> Result<String> {
     if let Some(t) = cli_flag.filter(|s| !s.is_empty()) {
-        return Ok(t);
+        return Ok(t.to_string());
     }
     if let Ok(t) = std::env::var("DISCORD_TOKEN") {
         if !t.is_empty() {
@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn resolve_token_from_flag() {
-        let got = resolve_token(Some("from-flag".to_string())).unwrap();
+        let got = resolve_token(Some("from-flag")).unwrap();
         assert_eq!(got, "from-flag");
     }
 }
