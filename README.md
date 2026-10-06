@@ -1,5 +1,11 @@
 # discord-cli (Rust)
 
+> [!WARNING]
+> **Deprecated — this repository is archived.** The CLI now lives in
+> [`discord-user-rs`](https://github.com/lengoclongk59/discord-user-rs) as the `discord` binary
+> (`cargo install discord-user-rs --features cli`). That version is a superset: archive/sync/search
+> plus send, edit, react, threads, roles, bans, invites, webhooks, and more.
+
 Local-first Rust port of [jackwener/discord-cli](https://github.com/jackwener/discord-cli). Read-only Discord archival CLI built on top of the local [`discord-user-rs`](../discord-user-rs) crate.
 
 ## Warning
